@@ -1,0 +1,223 @@
+-- ============================================================
+-- ALPHASUPPLY BOT — FULL SCHEMA
+-- Run this once in Supabase SQL Editor
+-- ============================================================
+
+-- ---------- USERS ----------
+CREATE TABLE IF NOT EXISTS users (
+  id          BIGINT PRIMARY KEY,
+  username    TEXT,
+  first_name  TEXT,
+  balance     NUMERIC DEFAULT 0,
+  is_admin    BOOLEAN DEFAULT FALSE,
+  created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ---------- PRODUCTS ----------
+CREATE TABLE IF NOT EXISTS products (
+  id          BIGSERIAL PRIMARY KEY,
+  name        TEXT NOT NULL,
+  category    TEXT NOT NULL,
+  price       NUMERIC NOT NULL DEFAULT 0,
+  description TEXT,
+  stock       INTEGER DEFAULT 0,
+  is_active   BOOLEAN DEFAULT TRUE,
+  created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_products_category ON products(category);
+CREATE INDEX IF NOT EXISTS idx_products_active   ON products(is_active);
+
+-- ---------- PRODUCT ITEMS (stock lines) ----------
+CREATE TABLE IF NOT EXISTS product_items (
+  id          BIGSERIAL PRIMARY KEY,
+  product_id  BIGINT REFERENCES products(id) ON DELETE CASCADE,
+  content     TEXT NOT NULL,
+  is_sold     BOOLEAN DEFAULT FALSE,
+  created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_items_product_unsold
+  ON product_items(product_id, is_sold);
+
+-- ---------- ORDERS ----------
+CREATE TABLE IF NOT EXISTS orders (
+  id              BIGSERIAL PRIMARY KEY,
+  user_id         BIGINT REFERENCES users(id) ON DELETE CASCADE,
+  product_id      BIGINT REFERENCES products(id) ON DELETE SET NULL,
+  quantity        INTEGER NOT NULL,
+  total_price     NUMERIC NOT NULL,
+  status          TEXT DEFAULT 'pending',   -- pending | completed | cancelled
+  delivered_items TEXT DEFAULT '',
+  created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_orders_user   ON orders(user_id);
+CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
+
+-- ---------- TRANSACTIONS ----------
+CREATE TABLE IF NOT EXISTS transactions (
+  id            BIGSERIAL PRIMARY KEY,
+  user_id       BIGINT REFERENCES users(id) ON DELETE CASCADE,
+  type          TEXT NOT NULL,              -- topup | purchase | refund | admin_adjust
+  amount        NUMERIC NOT NULL,
+  balance_after NUMERIC NOT NULL,
+  reference     TEXT,
+  note          TEXT,
+  created_at    TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_txn_user_created
+  ON transactions(user_id, created_at DESC);
+
+-- ---------- PAYMENT METHODS ----------
+CREATE TABLE IF NOT EXISTS payment_methods (
+  id          BIGSERIAL PRIMARY KEY,
+  name        TEXT NOT NULL,
+  number      TEXT NOT NULL,
+  sms_sender  TEXT,                         -- e.g. "bKash", "Nagad"
+  min_amount  NUMERIC DEFAULT 0,
+  is_active   BOOLEAN DEFAULT TRUE,
+  created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ---------- TOPUP REQUESTS ----------
+CREATE TABLE IF NOT EXISTS topup_requests (
+  id                  BIGSERIAL PRIMARY KEY,
+  user_id             BIGINT REFERENCES users(id) ON DELETE CASCADE,
+  amount              NUMERIC NOT NULL,
+  txn_id              TEXT,
+  status              TEXT DEFAULT 'pending',   -- pending | approved | rejected
+  payment_method_id   BIGINT REFERENCES payment_methods(id) ON DELETE SET NULL,
+  payment_method_name TEXT,
+  reject_reason       TEXT,
+  created_at          TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_topup_status ON topup_requests(status);
+CREATE INDEX IF NOT EXISTS idx_topup_user   ON topup_requests(user_id);
+
+-- ---------- PAYMENT SMS (populated by your SMS forwarder) ----------
+CREATE TABLE IF NOT EXISTS payment_sms (
+  id          BIGSERIAL PRIMARY KEY,
+  trx_id      TEXT NOT NULL,
+  amount      NUMERIC NOT NULL,
+  provider    TEXT,                         -- e.g. "bKash", "Nagad"
+  raw_text    TEXT,
+  is_used     BOOLEAN DEFAULT FALSE,
+  created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_sms_trx_used
+  ON payment_sms(trx_id, is_used);
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_sms_trx
+  ON payment_sms(trx_id);
+
+-- ============================================================
+-- RPC: purchase_product_batch
+-- ============================================================
+CREATE OR REPLACE FUNCTION purchase_product_batch(
+  p_user_id    BIGINT,
+  p_product_id BIGINT,
+  p_quantity   INTEGER
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_balance      NUMERIC;
+  v_price        NUMERIC;
+  v_total        NUMERIC;
+  v_items        TEXT[] := ARRAY[]::TEXT[];
+  v_item         RECORD;
+  v_count        INTEGER := 0;
+  v_new_balance  NUMERIC;
+BEGIN
+  -- Lock user
+  SELECT balance INTO v_balance
+    FROM users WHERE id = p_user_id FOR UPDATE;
+  IF v_balance IS NULL THEN
+    RAISE EXCEPTION 'user_not_found';
+  END IF;
+
+  -- Price
+  SELECT price INTO v_price FROM products WHERE id = p_product_id;
+  IF v_price IS NULL THEN
+    RAISE EXCEPTION 'product_not_found';
+  END IF;
+
+  v_total := v_price * p_quantity;
+
+  IF v_balance < v_total THEN
+    RAISE EXCEPTION 'insufficient_balance';
+  END IF;
+
+  -- Pick unsold items (locked)
+  FOR v_item IN
+    SELECT id, content FROM product_items
+     WHERE product_id = p_product_id AND is_sold = FALSE
+     ORDER BY id
+     LIMIT p_quantity
+     FOR UPDATE SKIP LOCKED
+  LOOP
+    UPDATE product_items SET is_sold = TRUE WHERE id = v_item.id;
+    v_items := array_append(v_items, v_item.content);
+    v_count := v_count + 1;
+  END LOOP;
+
+  IF v_count < p_quantity THEN
+    RAISE EXCEPTION 'out_of_stock';
+  END IF;
+
+  -- Deduct balance
+  v_new_balance := v_balance - v_total;
+  UPDATE users SET balance = v_new_balance WHERE id = p_user_id;
+
+  -- Update stock
+  UPDATE products
+     SET stock = GREATEST(0, stock - p_quantity)
+   WHERE id = p_product_id;
+
+  -- Log transaction
+  INSERT INTO transactions (user_id, type, amount, balance_after, reference, note)
+  VALUES (p_user_id, 'purchase', -v_total, v_new_balance,
+          'rpc_purchase', 'Purchase: ' || p_quantity || ' item(s)');
+
+  RETURN jsonb_build_object(
+    'items',       to_jsonb(v_items),
+    'total_cost',  v_total,
+    'new_balance', v_new_balance
+  );
+END;
+$$;
+
+-- ============================================================
+-- RPC: approve_topup
+-- ============================================================
+CREATE OR REPLACE FUNCTION approve_topup(p_topup_id BIGINT)
+RETURNS JSONB
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_topup       RECORD;
+  v_new_balance NUMERIC;
+BEGIN
+  SELECT * INTO v_topup
+    FROM topup_requests WHERE id = p_topup_id FOR UPDATE;
+  IF v_topup IS NULL THEN
+    RAISE EXCEPTION 'topup_not_found';
+  END IF;
+  IF v_topup.status <> 'pending' THEN
+    RAISE EXCEPTION 'already_processed';
+  END IF;
+
+  UPDATE topup_requests
+     SET status = 'approved'
+   WHERE id = p_topup_id;
+
+  UPDATE users
+     SET balance = balance + v_topup.amount
+   WHERE id = v_topup.user_id
+   RETURNING balance INTO v_new_balance;
+
+  INSERT INTO transactions (user_id, type, amount, balance_after, reference, note)
+  VALUES (v_topup.user_id, 'topup', v_topup.amount, v_new_balance,
+          v_topup.id::TEXT, 'Topup approved by admin');
+
+  RETURN jsonb_build_object('new_balance', v_new_balance);
+END;
+$$;

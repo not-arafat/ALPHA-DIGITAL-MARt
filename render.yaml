@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: alphasupplybot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: SUPPORT_CONTACT
+        sync: false
+      - key: CURRENCY
+        value: BDT
+      - key: PAYMENT_INFO
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.11.9
